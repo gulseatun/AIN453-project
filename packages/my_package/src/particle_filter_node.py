@@ -687,10 +687,27 @@ class DuckiebotParticleFilter:
         )
 
 
+    def draw_recent_path(self, image, path_msg, color, thickness, img_w, img_h, margin, scale, max_points=250):
+        points = []
+
+        recent_poses = path_msg.poses[-max_points:]
+
+        for pose_stamped in recent_poses:
+            x = pose_stamped.pose.position.x
+            y = pose_stamped.pose.position.y
+            px, py = self.world_to_pixel(x, y, img_w, img_h, margin, scale)
+
+            if 0 <= px < img_w and 0 <= py < img_h:
+                points.append((px, py))
+
+        if len(points) >= 2:
+            for i in range(1, len(points)):
+                cv2.line(image, points[i - 1], points[i], color, thickness)
+
     def publish_debug_map(self):
-        img_w = 900
-        img_h = 700
-        margin = 60
+        img_w = 620
+        img_h = 520
+        margin = 55
 
         image = np.ones((img_h, img_w, 3), dtype=np.uint8) * 245
 
@@ -698,16 +715,36 @@ class DuckiebotParticleFilter:
         scale_y = (img_h - 2 * margin) / max(1e-6, (self.y_max - self.y_min))
         scale = min(scale_x, scale_y)
 
-        # Room boundary
+        # Harita sınırı
         x1, y1 = self.world_to_pixel(self.x_min, self.y_min, img_w, img_h, margin, scale)
         x2, y2 = self.world_to_pixel(self.x_max, self.y_max, img_w, img_h, margin, scale)
-        cv2.rectangle(image, (x1, y2), (x2, y1), (30, 30, 30), 2)
+        cv2.rectangle(image, (x1, y2), (x2, y1), (40, 40, 40), 2)
 
-        # Tags
+        # Başlık
+        cv2.putText(
+            image,
+            "Particle Filter Map",
+            (20, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+        # Legend'i daha küçük ve üstte tut
+        cv2.putText(image, "Black: AR tags", (20, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(image, "Red: PF estimate/path", (20, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+        cv2.putText(image, "Gray: Odometry", (20, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (90, 90, 90), 1, cv2.LINE_AA)
+
+        # Tag'ler
         for i, (tag_x, tag_y) in enumerate(self.tag_map):
             px, py = self.world_to_pixel(tag_x, tag_y, img_w, img_h, margin, scale)
 
-            size_px = max(8, int(self.tag_size * scale / 2.0))
+            size_px = 9
 
             cv2.rectangle(
                 image,
@@ -720,38 +757,15 @@ class DuckiebotParticleFilter:
             cv2.putText(
                 image,
                 f"T{i}",
-                (px + 8, py - 8),
+                (px + 10, py + 4),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                0.42,
                 (0, 0, 0),
                 1,
                 cv2.LINE_AA
             )
 
-        # Paths
-        self.draw_path(
-            image,
-            self.odom_path,
-            color=(120, 120, 120),
-            thickness=2,
-            img_w=img_w,
-            img_h=img_h,
-            margin=margin,
-            scale=scale
-        )
-
-        self.draw_path(
-            image,
-            self.pf_path,
-            color=(0, 0, 255),
-            thickness=2,
-            img_w=img_w,
-            img_h=img_h,
-            margin=margin,
-            scale=scale
-        )
-
-        # Particles
+        # Particles önce çizilsin, path üstüne gelsin
         max_w = max([p[3] for p in self.particles]) if len(self.particles) > 0 else 1.0
         if max_w <= 0.0:
             max_w = 1.0
@@ -759,18 +773,47 @@ class DuckiebotParticleFilter:
         for p in self.particles:
             px, py = self.world_to_pixel(p[0], p[1], img_w, img_h, margin, scale)
 
+            if px < 0 or px >= img_w or py < 0 or py >= img_h:
+                continue
+
             score = max(0.0, min(1.0, p[3] / max_w))
 
-            # Low weight: blue-ish, high weight: red-ish
+            # düşük ağırlık açık mavi, yüksek ağırlık kırmızı
             color = (
-                int(255 * (1.0 - score)),
-                40,
+                int(220 * (1.0 - score)),
+                80,
                 int(255 * score)
             )
 
-            cv2.circle(image, (px, py), 2, color, -1)
+            radius = 2 if score < 0.7 else 3
+            cv2.circle(image, (px, py), radius, color, -1)
 
-        # PF estimate
+        # Path çiziminde sadece son N noktayı gösterelim
+        self.draw_recent_path(
+            image,
+            self.odom_path,
+            color=(120, 120, 120),
+            thickness=2,
+            img_w=img_w,
+            img_h=img_h,
+            margin=margin,
+            scale=scale,
+            max_points=250
+        )
+
+        self.draw_recent_path(
+            image,
+            self.pf_path,
+            color=(0, 0, 255),
+            thickness=2,
+            img_w=img_w,
+            img_h=img_h,
+            margin=margin,
+            scale=scale,
+            max_points=250
+        )
+
+        # PF estimate oku
         est_x, est_y, est_theta = self.compute_weighted_estimate()
         self.draw_robot_arrow(
             image,
@@ -784,7 +827,7 @@ class DuckiebotParticleFilter:
             scale=scale
         )
 
-        # Last odometry pose
+        # Odometry son poz
         if self.last_pose is not None:
             odom_x, odom_y, odom_theta = self.last_pose
             self.draw_robot_arrow(
@@ -799,52 +842,19 @@ class DuckiebotParticleFilter:
                 scale=scale
             )
 
-        # Legend
-        cv2.putText(
-            image,
-            "Black squares: AR tags",
-            (20, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 0),
-            2,
-            cv2.LINE_AA
-        )
-
-        cv2.putText(
-            image,
-            "Red path/arrow: Particle filter estimate",
-            (20, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA
-        )
-
-        cv2.putText(
-            image,
-            "Gray path/arrow: Odometry",
-            (20, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (80, 80, 80),
-            2,
-            cv2.LINE_AA
-        )
-
         cv2.putText(
             image,
             f"Particles: {len(self.particles)}",
-            (20, img_h - 25),
+            (20, img_h - 20),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.5,
             (0, 0, 0),
-            2,
+            1,
             cv2.LINE_AA
         )
 
         self.publish_compressed_image(self.debug_map_pub, image)
+
         self.latest_map_debug = image
         self.publish_combined_debug_view()
 
