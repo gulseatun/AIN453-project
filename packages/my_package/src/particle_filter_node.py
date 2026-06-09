@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import rospy
 
-from sensor_msgs.msg import CompressedImage, CameraInfo
+from sensor_msgs.msg import CompressedImage, CameraInfo, Image
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
@@ -57,19 +57,19 @@ class DuckiebotParticleFilter:
 
         self.num_particles = int(rospy.get_param("~num_particles", 500))
 
-        # 400 mm = 0.4 m
-        self.tag_size = float(rospy.get_param("~tag_size", 0.4))
+        # 60 mm = 0.06 m
+        self.tag_size = float(rospy.get_param("~tag_size", 0.06))
 
         # Eğer camera_info gelirse bu değerler otomatik güncellenecek.
         self.image_width = int(rospy.get_param("~image_width", 640))
         self.image_height = int(rospy.get_param("~image_height", 480))
         self.horizontal_fov = float(rospy.get_param("~horizontal_fov", 1.047))
 
-        # Gerçek düzenekte bu sınırları kendi alanına göre ayarla.
-        self.x_min = float(rospy.get_param("~x_min", -3.9))
-        self.x_max = float(rospy.get_param("~x_max", 3.9))
-        self.y_min = float(rospy.get_param("~y_min", -2.9))
-        self.y_max = float(rospy.get_param("~y_max", 2.9))
+        # Sınırlar alana göre ayarlanacak
+        self.x_min = float(rospy.get_param("~x_min", -0.05))
+        self.x_max = float(rospy.get_param("~x_max", 0.95))
+        self.y_min = float(rospy.get_param("~y_min", -0.05))
+        self.y_max = float(rospy.get_param("~y_max", 0.95))
 
         self.motion_sigma_xy = float(rospy.get_param("~motion_sigma_xy", 0.015))
         self.motion_sigma_theta = float(rospy.get_param("~motion_sigma_theta", 0.03))
@@ -77,7 +77,7 @@ class DuckiebotParticleFilter:
         self.sensor_sigma_dist = float(rospy.get_param("~sensor_sigma_dist", 0.35))
         self.sensor_sigma_angle = float(rospy.get_param("~sensor_sigma_angle", 0.18))
 
-        # GERÇEK DÜZENEKTE BUNLARI METRE CİNSİNDEN ÖLÇMEN GEREKİYOR.
+        # Alandaki tag'lere göre ayarlanacak
         # Format: [x1, y1, x2, y2, ..., x8, y8]
         tag_map_flat = rospy.get_param(
             "~tag_map",
@@ -188,6 +188,44 @@ class DuckiebotParticleFilter:
             MarkerArray,
             queue_size=10
         )
+
+        # -----------------------------
+        # Debug Publisher
+        # -----------------------------
+        self.debug_map_pub = rospy.Publisher(
+            "/pf_debug_map/compressed",
+            CompressedImage,
+            queue_size=1
+        )
+
+        self.tag_debug_image_pub = rospy.Publisher(
+            "/tag_debug_image/compressed",
+            CompressedImage,
+            queue_size=1
+        )
+
+        self.debug_view_pub = rospy.Publisher(
+            "/pf_debug_view/image",
+            Image,
+            queue_size=1
+        )
+
+        self.tag_debug_raw_pub = rospy.Publisher(
+            "/tag_debug_image/image",
+            Image,
+            queue_size=1
+        )
+
+        self.latest_camera_debug = None
+        self.latest_map_debug = None
+
+        self.save_debug_frames = rospy.get_param("~save_debug_frames", False)
+        self.debug_frame_dir = rospy.get_param("~debug_frame_dir", "/tmp/pf_debug")
+        self.debug_every_n_frames = int(rospy.get_param("~debug_every_n_frames", 10))
+        self.debug_frame_count = 0
+
+        if self.save_debug_frames:
+            os.makedirs(self.debug_frame_dir, exist_ok=True)
 
         # -----------------------------
         # Subscribers
@@ -320,8 +358,43 @@ class DuckiebotParticleFilter:
                 parameters=self.aruco_params
             )
 
+        debug_image = cv_image.copy()
+
         if ids is None or len(corners) == 0:
+            cv2.putText(
+                debug_image,
+                "No AprilTag detected",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA
+            )
+
+            self.latest_camera_debug = debug_image
+            self.publish_compressed_image(self.tag_debug_image_pub, debug_image)
+            self.publish_raw_image(self.tag_debug_raw_pub, debug_image)
+            self.publish_combined_debug_view()
             return
+
+        cv2.aruco.drawDetectedMarkers(debug_image, corners, ids)
+
+        cv2.putText(
+            debug_image,
+            f"Detected tags: {len(corners)}, ids={ids.flatten().tolist()}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+        self.latest_camera_debug = debug_image
+        self.publish_compressed_image(self.tag_debug_image_pub, debug_image)
+        self.publish_raw_image(self.tag_debug_raw_pub, debug_image)
+        self.publish_combined_debug_view()
 
         rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
             corners,
@@ -401,9 +474,11 @@ class DuckiebotParticleFilter:
 
         self.publish_particle_markers()
         self.publish_pf_estimate_and_path()
+        self.publish_debug_map()
 
         self.resample()
         self.publish_particles()
+
 
     def resample(self):
         new_particles = []
@@ -539,6 +614,290 @@ class DuckiebotParticleFilter:
             marker_array.markers.append(marker)
 
         self.particle_markers_pub.publish(marker_array)
+
+
+    def publish_compressed_image(self, publisher, image):
+        msg = CompressedImage()
+        msg.header.stamp = rospy.Time.now()
+        msg.format = "jpeg"
+
+        success, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+        )
+
+        if not success:
+            return
+
+        msg.data = encoded.tobytes()
+        publisher.publish(msg)
+
+    def publish_raw_image(self, publisher, image):
+        image = np.ascontiguousarray(image)
+
+        msg = Image()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "debug_view"
+
+        msg.height = image.shape[0]
+        msg.width = image.shape[1]
+        msg.encoding = "bgr8"
+        msg.is_bigendian = 0
+        msg.step = image.shape[1] * 3
+        msg.data = image.tobytes()
+
+        publisher.publish(msg)
+
+
+    def world_to_pixel(self, x, y, img_w, img_h, margin, scale):
+        px = int(margin + (x - self.x_min) * scale)
+        py = int(img_h - margin - (y - self.y_min) * scale)
+        return px, py
+
+
+    def draw_path(self, image, path_msg, color, thickness, img_w, img_h, margin, scale):
+        points = []
+
+        for pose_stamped in path_msg.poses:
+            x = pose_stamped.pose.position.x
+            y = pose_stamped.pose.position.y
+            px, py = self.world_to_pixel(x, y, img_w, img_h, margin, scale)
+            points.append((px, py))
+
+        if len(points) >= 2:
+            for i in range(1, len(points)):
+                cv2.line(image, points[i - 1], points[i], color, thickness)
+
+
+    def draw_robot_arrow(self, image, x, y, theta, color, img_w, img_h, margin, scale):
+        px, py = self.world_to_pixel(x, y, img_w, img_h, margin, scale)
+
+        length = 35
+        end_x = int(px + length * math.cos(theta))
+        end_y = int(py - length * math.sin(theta))
+
+        cv2.arrowedLine(
+            image,
+            (px, py),
+            (end_x, end_y),
+            color,
+            3,
+            tipLength=0.35
+        )
+
+
+    def publish_debug_map(self):
+        img_w = 900
+        img_h = 700
+        margin = 60
+
+        image = np.ones((img_h, img_w, 3), dtype=np.uint8) * 245
+
+        scale_x = (img_w - 2 * margin) / max(1e-6, (self.x_max - self.x_min))
+        scale_y = (img_h - 2 * margin) / max(1e-6, (self.y_max - self.y_min))
+        scale = min(scale_x, scale_y)
+
+        # Room boundary
+        x1, y1 = self.world_to_pixel(self.x_min, self.y_min, img_w, img_h, margin, scale)
+        x2, y2 = self.world_to_pixel(self.x_max, self.y_max, img_w, img_h, margin, scale)
+        cv2.rectangle(image, (x1, y2), (x2, y1), (30, 30, 30), 2)
+
+        # Tags
+        for i, (tag_x, tag_y) in enumerate(self.tag_map):
+            px, py = self.world_to_pixel(tag_x, tag_y, img_w, img_h, margin, scale)
+
+            size_px = max(8, int(self.tag_size * scale / 2.0))
+
+            cv2.rectangle(
+                image,
+                (px - size_px, py - size_px),
+                (px + size_px, py + size_px),
+                (0, 0, 0),
+                -1
+            )
+
+            cv2.putText(
+                image,
+                f"T{i}",
+                (px + 8, py - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA
+            )
+
+        # Paths
+        self.draw_path(
+            image,
+            self.odom_path,
+            color=(120, 120, 120),
+            thickness=2,
+            img_w=img_w,
+            img_h=img_h,
+            margin=margin,
+            scale=scale
+        )
+
+        self.draw_path(
+            image,
+            self.pf_path,
+            color=(0, 0, 255),
+            thickness=2,
+            img_w=img_w,
+            img_h=img_h,
+            margin=margin,
+            scale=scale
+        )
+
+        # Particles
+        max_w = max([p[3] for p in self.particles]) if len(self.particles) > 0 else 1.0
+        if max_w <= 0.0:
+            max_w = 1.0
+
+        for p in self.particles:
+            px, py = self.world_to_pixel(p[0], p[1], img_w, img_h, margin, scale)
+
+            score = max(0.0, min(1.0, p[3] / max_w))
+
+            # Low weight: blue-ish, high weight: red-ish
+            color = (
+                int(255 * (1.0 - score)),
+                40,
+                int(255 * score)
+            )
+
+            cv2.circle(image, (px, py), 2, color, -1)
+
+        # PF estimate
+        est_x, est_y, est_theta = self.compute_weighted_estimate()
+        self.draw_robot_arrow(
+            image,
+            est_x,
+            est_y,
+            est_theta,
+            color=(0, 0, 255),
+            img_w=img_w,
+            img_h=img_h,
+            margin=margin,
+            scale=scale
+        )
+
+        # Last odometry pose
+        if self.last_pose is not None:
+            odom_x, odom_y, odom_theta = self.last_pose
+            self.draw_robot_arrow(
+                image,
+                odom_x,
+                odom_y,
+                odom_theta,
+                color=(80, 80, 80),
+                img_w=img_w,
+                img_h=img_h,
+                margin=margin,
+                scale=scale
+            )
+
+        # Legend
+        cv2.putText(
+            image,
+            "Black squares: AR tags",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            image,
+            "Red path/arrow: Particle filter estimate",
+            (20, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            image,
+            "Gray path/arrow: Odometry",
+            (20, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (80, 80, 80),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            image,
+            f"Particles: {len(self.particles)}",
+            (20, img_h - 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+        self.publish_compressed_image(self.debug_map_pub, image)
+        self.latest_map_debug = image
+        self.publish_combined_debug_view()
+
+        if self.save_debug_frames:
+            if self.debug_frame_count % self.debug_every_n_frames == 0:
+                filename = os.path.join(
+                    self.debug_frame_dir,
+                    f"pf_map_{self.debug_frame_count:06d}.jpg"
+                )
+                cv2.imwrite(filename, image)
+
+            self.debug_frame_count += 1
+
+    def publish_combined_debug_view(self):
+        if self.latest_camera_debug is None or self.latest_map_debug is None:
+            return
+
+        camera_image = self.latest_camera_debug.copy()
+        map_image = self.latest_map_debug.copy()
+
+        target_h = 500
+
+        cam_scale = target_h / camera_image.shape[0]
+        cam_w = int(camera_image.shape[1] * cam_scale)
+
+        camera_resized = cv2.resize(camera_image, (cam_w, target_h))
+        map_resized = cv2.resize(map_image, (700, target_h))
+
+        combined = np.hstack((camera_resized, map_resized))
+
+        cv2.putText(
+            combined,
+            "Camera AprilTag View",
+            (20, target_h - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            combined,
+            "Particle Filter Map",
+            (cam_w + 20, target_h - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+        self.publish_raw_image(self.debug_view_pub, combined)
 
     def publish_tag_markers(self, event=None):
         marker_array = MarkerArray()
