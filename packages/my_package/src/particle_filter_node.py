@@ -81,8 +81,8 @@ class DuckiebotParticleFilter:
         self.sensor_sigma_angle = float(rospy.get_param("~sensor_sigma_angle", 0.18))
 
         # Odometry frame -> map frame offset.
-        self.odom_map_x0 = float(rospy.get_param("~odom_map_x0", 0.85))
-        self.odom_map_y0 = float(rospy.get_param("~odom_map_y0", 0.85))
+        self.odom_map_x0 = float(rospy.get_param("~odom_map_x0", 0.75))
+        self.odom_map_y0 = float(rospy.get_param("~odom_map_y0", 0.75))
         self.odom_map_theta0 = float(rospy.get_param("~odom_map_theta0", 0.0))
 
         # Alandaki tag'lere göre ayarlanacak
