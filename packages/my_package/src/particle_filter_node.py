@@ -2,6 +2,7 @@
 
 import math
 import random
+import threading
 
 import cv2
 import numpy as np
@@ -40,6 +41,8 @@ class DuckiebotParticleFilter:
         self.robot_name = rospy.get_param("~robot_name", "bear")
         self.world_frame = rospy.get_param("~world_frame", "map")
 
+        self.lock = threading.RLock()
+
         self.image_topic = rospy.get_param(
             "~image_topic",
             f"/{self.robot_name}/camera_node/image/compressed"
@@ -63,7 +66,7 @@ class DuckiebotParticleFilter:
         # Eğer camera_info gelirse bu değerler otomatik güncellenecek.
         self.image_width = int(rospy.get_param("~image_width", 640))
         self.image_height = int(rospy.get_param("~image_height", 480))
-        self.horizontal_fov = float(rospy.get_param("~horizontal_fov", 1.047))
+        self.horizontal_fov = float(rospy.get_param("~horizontal_fov", 2.79))
 
         # Sınırlar alana göre ayarlanacak
         self.x_min = float(rospy.get_param("~x_min", -0.05))
@@ -78,8 +81,8 @@ class DuckiebotParticleFilter:
         self.sensor_sigma_angle = float(rospy.get_param("~sensor_sigma_angle", 0.18))
 
         # Odometry frame -> map frame offset.
-        self.odom_map_x0 = float(rospy.get_param("~odom_map_x0", 0.90))
-        self.odom_map_y0 = float(rospy.get_param("~odom_map_y0", 0.90))
+        self.odom_map_x0 = float(rospy.get_param("~odom_map_x0", 0.85))
+        self.odom_map_y0 = float(rospy.get_param("~odom_map_y0", 0.85))
         self.odom_map_theta0 = float(rospy.get_param("~odom_map_theta0", 0.0))
 
         # Alandaki tag'lere göre ayarlanacak
@@ -149,6 +152,11 @@ class DuckiebotParticleFilter:
         self.particles = []
         self.last_pose = None
         self.odom_origin = None
+
+
+        self.map1 = None
+        self.map2 = None
+        self.rectified_camera_matrix = None
 
         self.pf_path = Path()
         self.pf_path.header.frame_id = self.world_frame
@@ -294,6 +302,8 @@ class DuckiebotParticleFilter:
             self.debug_view_timer_callback
         )
 
+        
+
         rospy.loginfo("Duckiebot particle filter started.")
         rospy.loginfo(f"Image topic: {self.image_topic}")
         rospy.loginfo(f"Camera info topic: {self.camera_info_topic}")
@@ -324,10 +334,34 @@ class DuckiebotParticleFilter:
         if msg.K[0] <= 0.0:
             return
 
-        self.camera_matrix = np.array(msg.K, dtype=np.float32).reshape(3, 3)
+        with self.lock:
+            self.camera_matrix = np.array(msg.K, dtype=np.float32).reshape(3, 3)
+            self.dist_coeffs = np.array(msg.D, dtype=np.float32).reshape(-1, 1)
+            
+            # Initialize rectification lookup maps once to protect embedded CPU overhead
+            if self.map1 is None:
+                w, h = msg.width, msg.height
+                self.image_width = w
+                self.image_height = h
 
-        if len(msg.D) >= 5:
-            self.dist_coeffs = np.array(msg.D[:5], dtype=np.float32).reshape(5, 1)
+                if getattr(msg, 'distortion_model', 'equidistant') == 'equidistant':
+                    # Rectification logic tailored for Duckiebot fisheye lenses
+                    self.rectified_camera_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                        self.camera_matrix, self.dist_coeffs, (w, h), np.eye(3), balance=0.0
+                    )
+                    self.map1, self.map2 = cv2.fisheye.initUndistortRectifyMap(
+                        self.camera_matrix, self.dist_coeffs, np.eye(3), 
+                        self.rectified_camera_matrix, (w, h), cv2.CV_16SC2
+                    )
+                else:
+                    # Fallback for standard pinhole cameras
+                    self.rectified_camera_matrix, _ = cv2.getOptimalNewCameraMatrix(
+                        self.camera_matrix, self.dist_coeffs, (w, h), 0, (w, h)
+                    )
+                    self.map1, self.map2 = cv2.initUndistortRectifyMap(
+                        self.camera_matrix, self.dist_coeffs, np.eye(3), 
+                        self.rectified_camera_matrix, (w, h), cv2.CV_16SC2
+                    )
 
     def pose_callback(self, msg):
         current_x = float(msg.x)
@@ -361,61 +395,90 @@ class DuckiebotParticleFilter:
         self.last_pose = (current_x, current_y, current_theta)
 
     def predict(self, dx_local, dy_local, dtheta):
-        for p in self.particles:
-            p_cos = math.cos(p[2])
-            p_sin = math.sin(p[2])
 
-            p[0] += (
-                dx_local * p_cos
-                - dy_local * p_sin
-                + random.gauss(0.0, self.motion_sigma_xy)
-            )
+        with self.lock:
+            for p in self.particles:
+                p_cos = math.cos(p[2])
+                p_sin = math.sin(p[2])
 
-            p[1] += (
-                dx_local * p_sin
-                + dy_local * p_cos
-                + random.gauss(0.0, self.motion_sigma_xy)
-            )
+                p[0] += (
+                    dx_local * p_cos
+                    - dy_local * p_sin
+                    + random.gauss(0.0, self.motion_sigma_xy)
+                )
 
-            p[2] = wrap_angle(
-                p[2] + dtheta + random.gauss(0.0, self.motion_sigma_theta)
-            )
+                p[1] += (
+                    dx_local * p_sin
+                    + dy_local * p_cos
+                    + random.gauss(0.0, self.motion_sigma_xy)
+                )
 
-            p[0] = max(self.x_min, min(self.x_max, p[0]))
-            p[1] = max(self.y_min, min(self.y_max, p[1]))
+                p[2] = wrap_angle(
+                    p[2] + dtheta + random.gauss(0.0, self.motion_sigma_theta)
+                )
+
+                p[0] = max(self.x_min, min(self.x_max, p[0]))
+                p[1] = max(self.y_min, min(self.y_max, p[1]))
 
         self.publish_particles()
         self.publish_pf_estimate_and_path()
 
     def image_callback(self, msg):
-        np_arr = np.frombuffer(msg.data, np.uint8)
-        cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        if cv_image is None:
-            rospy.logwarn("Compressed image decode failed.")
-            return
+            if cv_image is None:
+                rospy.logwarn("Compressed image decode failed.")
+                return
 
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+            # ---- unwarp the raw fisheye frame into a linear projection space ----
+            with self.lock:
+                if self.map1 is not None and self.map2 is not None:
+                    cv_image = cv2.remap(cv_image, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
+                    cam_matrix = self.rectified_camera_matrix
+                else:
+                    cam_matrix = self.camera_matrix
 
-        if self.use_new_aruco_api:
-            corners, ids, _ = self.aruco_detector.detectMarkers(gray)
-        else:
-            corners, ids, _ = cv2.aruco.detectMarkers(
-                gray,
-                self.aruco_dict,
-                parameters=self.aruco_params
-            )
+            gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
-        debug_image = cv_image.copy()
+            if self.use_new_aruco_api:
+                corners, ids, _ = self.aruco_detector.detectMarkers(gray)
+            else:
+                corners, ids, _ = cv2.aruco.detectMarkers(
+                    gray,
+                    self.aruco_dict,
+                    parameters=self.aruco_params
+                )
 
-        if ids is None or len(corners) == 0:
+            debug_image = cv_image.copy()
+
+            if ids is None or len(corners) == 0:
+                cv2.putText(
+                    debug_image,
+                    "No AprilTag detected",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA
+                )
+
+                self.latest_camera_debug = debug_image
+                self.publish_compressed_image(self.tag_debug_image_pub, debug_image)
+                self.publish_raw_image(self.tag_debug_raw_pub, debug_image)
+                self.publish_combined_debug_view()
+                return
+
+            cv2.aruco.drawDetectedMarkers(debug_image, corners, ids)
+
             cv2.putText(
                 debug_image,
-                "No AprilTag detected",
+                f"Detected tags: {len(corners)}, ids={ids.flatten().tolist()}",
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1.0,
-                (0, 0, 255),
+                0.8,
+                (0, 255, 0),
                 2,
                 cv2.LINE_AA
             )
@@ -424,149 +487,140 @@ class DuckiebotParticleFilter:
             self.publish_compressed_image(self.tag_debug_image_pub, debug_image)
             self.publish_raw_image(self.tag_debug_raw_pub, debug_image)
             self.publish_combined_debug_view()
-            return
 
-        cv2.aruco.drawDetectedMarkers(debug_image, corners, ids)
+            # Run pose estimation using the flattened matrix with ZERO distortion coefficients
+            rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+                corners,
+                self.tag_size,
+                cam_matrix,
+                np.zeros((5, 1), dtype=np.float32)  # Set to zero because the frame is already unwarped
+            )
 
-        cv2.putText(
-            debug_image,
-            f"Detected tags: {len(corners)}, ids={ids.flatten().tolist()}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA
-        )
+            measurements = []
 
-        self.latest_camera_debug = debug_image
-        self.publish_compressed_image(self.tag_debug_image_pub, debug_image)
-        self.publish_raw_image(self.tag_debug_raw_pub, debug_image)
-        self.publish_combined_debug_view()
+            for i in range(len(corners)):
+                tvec = tvecs[i][0]
 
-        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-            corners,
-            self.tag_size,
-            self.camera_matrix,
-            self.dist_coeffs
-        )
+                x_cam = float(tvec[0])
+                z_cam = float(tvec[2])
 
-        measurements = []
+                distance = math.sqrt(x_cam ** 2 + z_cam ** 2)
+                bearing = -math.atan2(x_cam, z_cam)
 
-        for i in range(len(corners)):
-            # ID localization'da kullanılmıyor.
-            # Çünkü ödevde tüm fiziksel tag'lerin aynı ID'ye sahip olması isteniyor.
-            tvec = tvecs[i][0]
+                measurements.append((distance, bearing))
 
-            x_cam = float(tvec[0])
-            z_cam = float(tvec[2])
+            rospy.loginfo_throttle(
+                1.0,
+                f"Detected AprilTags: {len(measurements)}, ids={ids.flatten().tolist()}"
+            )
 
-            distance = math.sqrt(x_cam ** 2 + z_cam ** 2)
-            bearing = -math.atan2(x_cam, z_cam)
-
-            measurements.append((distance, bearing))
-
-        rospy.loginfo_throttle(
-            1.0,
-            f"Detected AprilTags: {len(measurements)}, ids={ids.flatten().tolist()}"
-        )
-
-        self.update_weights(measurements)
+            self.update_weights(measurements)
 
     def update_weights(self, measurements):
-        weights = []
+            if not measurements:
+                return
 
-        for p in self.particles:
-            prob_particle = 1.0
+            with self.lock:
+                particles = np.array(self.particles)  # Shape: (N, 4)
+                N = len(particles)
 
-            for measured_dist, measured_bearing in measurements:
-                prob_measurement = 0.0
+                particle_positions = particles[:, :2]  # Shape: (N, 2)
+                particle_thetas = particles[:, 2]      # Shape: (N,)
+                tags = np.array(self.tag_map)          # Shape: (8, 2)
 
-                for tag_x, tag_y in self.tag_map:
-                    expected_dx = tag_x - p[0]
-                    expected_dy = tag_y - p[1]
+                # Reshape for matrix broadcasting -> Shape: (N, 8)
+                tags_x = tags[:, 0][np.newaxis, :]
+                tags_y = tags[:, 1][np.newaxis, :]
+                p_x = particle_positions[:, 0][:, np.newaxis]
+                p_y = particle_positions[:, 1][:, np.newaxis]
 
-                    expected_dist = math.sqrt(expected_dx ** 2 + expected_dy ** 2)
+                dx = tags_x - p_x
+                dy = tags_y - p_y
 
-                    expected_bearing = wrap_angle(
-                        math.atan2(expected_dy, expected_dx) - p[2]
-                    )
+                # Compute expected distances and bearings for all combinations
+                expected_dists = np.sqrt(dx**2 + dy**2)
+                raw_bearings = np.arctan2(dy, dx)
+                expected_bearings = raw_bearings - particle_thetas[:, np.newaxis]
+                expected_bearings = np.arctan2(np.sin(expected_bearings), np.cos(expected_bearings))
 
-                    dist_error = measured_dist - expected_dist
-                    bearing_error = wrap_angle(measured_bearing - expected_bearing)
+                prob_particles = np.ones(N)
 
-                    prob_d = math.exp(
-                        -0.5 * (dist_error / self.sensor_sigma_dist) ** 2
-                    )
+                # Loop through active measurements, calculating tag probabilities in parallel
+                for measured_dist, measured_bearing in measurements:
+                    dist_error = measured_dist - expected_dists
+                    bearing_error = measured_bearing - expected_bearings
+                    bearing_error = np.arctan2(np.sin(bearing_error), np.cos(bearing_error))
 
-                    prob_a = math.exp(
-                        -0.5 * (bearing_error / self.sensor_sigma_angle) ** 2
-                    )
+                    prob_d = np.exp(-0.5 * (dist_error / self.sensor_sigma_dist) ** 2)
+                    prob_a = np.exp(-0.5 * (bearing_error / self.sensor_sigma_angle) ** 2)
 
-                    prob_measurement += prob_d * prob_a
+                    # Sum probabilities across all 8 tag hypotheses
+                    prob_measurement = np.sum(prob_d * prob_a, axis=1)
+                    prob_particles *= np.maximum(prob_measurement, 1e-300)
 
-                prob_particle *= max(prob_measurement, 1e-300)
+                sum_w = np.sum(prob_particles)
 
-            weights.append(prob_particle)
+                if sum_w < 1e-300:
+                    rospy.logwarn("All weights collapsed. Resetting weights.")
+                    weights = [1.0 / N] * N
+                    for i in range(N):
+                        self.particles[i][3] = weights[i]
+                else:
+                    weights = prob_particles / sum_w
+                    for i in range(N):
+                        self.particles[i][3] = float(weights[i])
 
-        sum_w = sum(weights)
+            self.publish_particle_markers()
+            self.publish_pf_estimate_and_path()
 
-        if sum_w < 1e-300:
-            rospy.logwarn("All weights collapsed. Resetting weights.")
-            weights = [1.0 / self.num_particles] * self.num_particles
-        else:
-            weights = [w / sum_w for w in weights]
-
-        for i in range(self.num_particles):
-            self.particles[i][3] = weights[i]
-
-        self.publish_particle_markers()
-        self.publish_pf_estimate_and_path()
-
-        self.resample()
-        self.publish_particles()
+            self.resample()
+            self.publish_particles()
 
 
     def resample(self):
-        new_particles = []
 
-        index = random.randint(0, self.num_particles - 1)
-        beta = 0.0
-        max_w = max(p[3] for p in self.particles)
+        with self.lock:
+            new_particles = []
 
-        if max_w <= 0.0:
-            self.init_particles()
-            return
+            index = random.randint(0, self.num_particles - 1)
+            beta = 0.0
+            max_w = max(p[3] for p in self.particles)
 
-        for _ in range(self.num_particles):
-            beta += random.uniform(0.0, 2.0 * max_w)
+            if max_w <= 0.0:
+                self.init_particles()
+                return
 
-            while beta > self.particles[index][3]:
-                beta -= self.particles[index][3]
-                index = (index + 1) % self.num_particles
+            for _ in range(self.num_particles):
+                beta += random.uniform(0.0, 2.0 * max_w)
 
-            p = self.particles[index]
-            new_particles.append([p[0], p[1], p[2], 1.0 / self.num_particles])
+                while beta > self.particles[index][3]:
+                    beta -= self.particles[index][3]
+                    index = (index + 1) % self.num_particles
 
-        self.particles = new_particles
+                p = self.particles[index]
+                new_particles.append([p[0], p[1], p[2], 1.0 / self.num_particles])
+
+            self.particles = new_particles
 
     def compute_weighted_estimate(self):
-        sum_w = sum(p[3] for p in self.particles)
 
-        if sum_w <= 0.0:
-            weights = [1.0 / self.num_particles] * self.num_particles
-        else:
-            weights = [p[3] / sum_w for p in self.particles]
+        with self.lock:
+            sum_w = sum(p[3] for p in self.particles)
 
-        x = sum(w * p[0] for w, p in zip(weights, self.particles))
-        y = sum(w * p[1] for w, p in zip(weights, self.particles))
+            if sum_w <= 0.0:
+                weights = [1.0 / self.num_particles] * self.num_particles
+            else:
+                weights = [p[3] / sum_w for p in self.particles]
 
-        sin_sum = sum(w * math.sin(p[2]) for w, p in zip(weights, self.particles))
-        cos_sum = sum(w * math.cos(p[2]) for w, p in zip(weights, self.particles))
+            x = sum(w * p[0] for w, p in zip(weights, self.particles))
+            y = sum(w * p[1] for w, p in zip(weights, self.particles))
 
-        theta = math.atan2(sin_sum, cos_sum)
+            sin_sum = sum(w * math.sin(p[2]) for w, p in zip(weights, self.particles))
+            cos_sum = sum(w * math.cos(p[2]) for w, p in zip(weights, self.particles))
 
-        return x, y, theta
+            theta = math.atan2(sin_sum, cos_sum)
+
+            return x, y, theta
 
     def publish_pf_estimate_and_path(self):
         x, y, theta = self.compute_weighted_estimate()
@@ -643,13 +697,15 @@ class DuckiebotParticleFilter:
         pose_array.header.frame_id = self.world_frame
         pose_array.header.stamp = rospy.Time.now()
 
-        for p in self.particles:
-            pose = Pose()
-            pose.position.x = float(p[0])
-            pose.position.y = float(p[1])
-            pose.position.z = 0.0
-            pose.orientation = yaw_to_quaternion(p[2])
-            pose_array.poses.append(pose)
+        with self.lock:
+
+            for p in self.particles:
+                pose = Pose()
+                pose.position.x = float(p[0])
+                pose.position.y = float(p[1])
+                pose.position.z = 0.0
+                pose.orientation = yaw_to_quaternion(p[2])
+                pose_array.poses.append(pose)
 
         self.particles_pub.publish(pose_array)
 
@@ -660,37 +716,38 @@ class DuckiebotParticleFilter:
         delete_marker.action = Marker.DELETEALL
         marker_array.markers.append(delete_marker)
 
-        max_w = max(p[3] for p in self.particles)
-        if max_w <= 0.0:
-            max_w = 1.0
+        with self.lock:
+            max_w = max(p[3] for p in self.particles)
+            if max_w <= 0.0:
+                max_w = 1.0
 
-        now = rospy.Time.now()
+            now = rospy.Time.now()
 
-        for i, p in enumerate(self.particles):
-            marker = Marker()
-            marker.header.frame_id = self.world_frame
-            marker.header.stamp = now
-            marker.ns = "particles"
-            marker.id = i
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
+            for i, p in enumerate(self.particles):
+                marker = Marker()
+                marker.header.frame_id = self.world_frame
+                marker.header.stamp = now
+                marker.ns = "particles"
+                marker.id = i
+                marker.type = Marker.SPHERE
+                marker.action = Marker.ADD
 
-            marker.pose.position.x = float(p[0])
-            marker.pose.position.y = float(p[1])
-            marker.pose.position.z = 0.03
+                marker.pose.position.x = float(p[0])
+                marker.pose.position.y = float(p[1])
+                marker.pose.position.z = 0.03
 
-            marker.scale.x = 0.05
-            marker.scale.y = 0.05
-            marker.scale.z = 0.05
+                marker.scale.x = 0.05
+                marker.scale.y = 0.05
+                marker.scale.z = 0.05
 
-            score = max(0.0, min(1.0, p[3] / max_w))
+                score = max(0.0, min(1.0, p[3] / max_w))
 
-            marker.color.r = float(score)
-            marker.color.g = 0.1
-            marker.color.b = float(1.0 - score)
-            marker.color.a = 0.8
+                marker.color.r = float(score)
+                marker.color.g = 0.1
+                marker.color.b = float(1.0 - score)
+                marker.color.a = 0.8
 
-            marker_array.markers.append(marker)
+                marker_array.markers.append(marker)
 
         self.particle_markers_pub.publish(marker_array)
 
@@ -814,33 +871,34 @@ class DuckiebotParticleFilter:
                 cv2.putText(image, f"T{i}", (px + 10, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 
                             0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
-            # Calculate max weight to normalize particle colors
-            max_w = max(p[3] for p in self.particles) if self.particles else 1.0
-            if max_w <= 0.0:
-                max_w = 1.0
+            with self.lock:
+                # Calculate max weight to normalize particle colors
+                max_w = max(p[3] for p in self.particles) if self.particles else 1.0
+                if max_w <= 0.0:
+                    max_w = 1.0
 
-            # Draw Particles (Color by weight, include orientation)
-            for p in self.particles:
-                px, py = self.world_to_pixel(p[0], p[1], img_w, img_h, margin, scale)
-                if px < 0 or px >= img_w or py < 0 or py >= img_h:
-                    continue
+                # Draw Particles (Color by weight, include orientation)
+                for p in self.particles:
+                    px, py = self.world_to_pixel(p[0], p[1], img_w, img_h, margin, scale)
+                    if px < 0 or px >= img_w or py < 0 or py >= img_h:
+                        continue
 
-                # Normalize score
-                score = max(0.0, min(1.0, p[3] / max_w))
+                    # Normalize score
+                    score = max(0.0, min(1.0, p[3] / max_w))
 
-                # Color Gradient: Blue (Low Weight) -> Red (High Weight)
-                b = int(255 * (1.0 - score))
-                g = int(50 + 100 * score)
-                r = int(255 * score)
-                color = (b, g, r)
+                    # Color Gradient: Blue (Low Weight) -> Red (High Weight)
+                    b = int(255 * (1.0 - score))
+                    g = int(50 + 100 * score)
+                    r = int(255 * score)
+                    color = (b, g, r)
 
-                # Draw directional tail to represent 'theta'
-                tail_length = 6
-                end_x = int(px - tail_length * math.cos(p[2]))
-                end_y = int(py + tail_length * math.sin(p[2]))  # + because OpenCV y is inverted
-                
-                cv2.line(image, (px, py), (end_x, end_y), color, 1, cv2.LINE_AA)
-                cv2.circle(image, (px, py), 2, color, -1, cv2.LINE_AA)
+                    # Draw directional tail to represent 'theta'
+                    tail_length = 6
+                    end_x = int(px - tail_length * math.cos(p[2]))
+                    end_y = int(py + tail_length * math.sin(p[2]))  # + because OpenCV y is inverted
+                    
+                    cv2.line(image, (px, py), (end_x, end_y), color, 1, cv2.LINE_AA)
+                    cv2.circle(image, (px, py), 2, color, -1, cv2.LINE_AA)
 
             # Draw Trajectories
             self.draw_recent_path(image, self.odom_path, color=(150, 150, 150), thickness=2, 
