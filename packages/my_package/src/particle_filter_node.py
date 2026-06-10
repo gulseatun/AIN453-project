@@ -338,14 +338,14 @@ class DuckiebotParticleFilter:
             self.camera_matrix = np.array(msg.K, dtype=np.float32).reshape(3, 3)
             self.dist_coeffs = np.array(msg.D, dtype=np.float32).reshape(-1, 1)
             
-            # Initialize rectification lookup maps once to protect embedded CPU overhead
+            
             if self.map1 is None:
                 w, h = msg.width, msg.height
                 self.image_width = w
                 self.image_height = h
 
                 if getattr(msg, 'distortion_model', 'equidistant') == 'equidistant':
-                    # Rectification logic tailored for Duckiebot fisheye lenses
+                    
                     self.rectified_camera_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
                         self.camera_matrix, self.dist_coeffs, (w, h), np.eye(3), balance=0.0
                     )
@@ -354,7 +354,7 @@ class DuckiebotParticleFilter:
                         self.rectified_camera_matrix, (w, h), cv2.CV_16SC2
                     )
                 else:
-                    # Fallback for standard pinhole cameras
+            
                     self.rectified_camera_matrix, _ = cv2.getOptimalNewCameraMatrix(
                         self.camera_matrix, self.dist_coeffs, (w, h), 0, (w, h)
                     )
@@ -431,7 +431,7 @@ class DuckiebotParticleFilter:
                 rospy.logwarn("Compressed image decode failed.")
                 return
 
-            # ---- unwarp the raw fisheye frame into a linear projection space ----
+           
             with self.lock:
                 if self.map1 is not None and self.map2 is not None:
                     cv_image = cv2.remap(cv_image, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
@@ -488,12 +488,12 @@ class DuckiebotParticleFilter:
             self.publish_raw_image(self.tag_debug_raw_pub, debug_image)
             self.publish_combined_debug_view()
 
-            # Run pose estimation using the flattened matrix with ZERO distortion coefficients
+       
             rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
                 corners,
                 self.tag_size,
                 cam_matrix,
-                np.zeros((5, 1), dtype=np.float32)  # Set to zero because the frame is already unwarped
+                np.zeros((5, 1), dtype=np.float32) 
             )
 
             measurements = []
@@ -528,7 +528,7 @@ class DuckiebotParticleFilter:
                 particle_thetas = particles[:, 2]      # Shape: (N,)
                 tags = np.array(self.tag_map)          # Shape: (8, 2)
 
-                # Reshape for matrix broadcasting -> Shape: (N, 8)
+                
                 tags_x = tags[:, 0][np.newaxis, :]
                 tags_y = tags[:, 1][np.newaxis, :]
                 p_x = particle_positions[:, 0][:, np.newaxis]
@@ -537,7 +537,7 @@ class DuckiebotParticleFilter:
                 dx = tags_x - p_x
                 dy = tags_y - p_y
 
-                # Compute expected distances and bearings for all combinations
+                
                 expected_dists = np.sqrt(dx**2 + dy**2)
                 raw_bearings = np.arctan2(dy, dx)
                 expected_bearings = raw_bearings - particle_thetas[:, np.newaxis]
@@ -545,7 +545,7 @@ class DuckiebotParticleFilter:
 
                 prob_particles = np.ones(N)
 
-                # Loop through active measurements, calculating tag probabilities in parallel
+             
                 for measured_dist, measured_bearing in measurements:
                     dist_error = measured_dist - expected_dists
                     bearing_error = measured_bearing - expected_bearings
@@ -554,7 +554,7 @@ class DuckiebotParticleFilter:
                     prob_d = np.exp(-0.5 * (dist_error / self.sensor_sigma_dist) ** 2)
                     prob_a = np.exp(-0.5 * (bearing_error / self.sensor_sigma_angle) ** 2)
 
-                    # Sum probabilities across all 8 tag hypotheses
+                   
                     prob_measurement = np.sum(prob_d * prob_a, axis=1)
                     prob_particles *= np.maximum(prob_measurement, 1e-300)
 
@@ -836,7 +836,7 @@ class DuckiebotParticleFilter:
 
             if len(points) >= 2:
                 for i in range(1, len(points)):
-                    # Added cv2.LINE_AA for smoother path rendering
+                 
                     cv2.line(image, points[i - 1], points[i], color, thickness, cv2.LINE_AA)
 
     def debug_view_timer_callback(self, event=None):
@@ -847,24 +847,23 @@ class DuckiebotParticleFilter:
             img_h = 520
             margin = 55
 
-            # Use a darker, sleeker background to make colors pop
+     
             image = np.ones((img_h, img_w, 3), dtype=np.uint8) * 30
 
             scale_x = (img_w - 2 * margin) / max(1e-6, (self.x_max - self.x_min))
             scale_y = (img_h - 2 * margin) / max(1e-6, (self.y_max - self.y_min))
             scale = min(scale_x, scale_y)
 
-            # Draw the Room Boundary (Arena)
+          
             x1, y1 = self.world_to_pixel(self.x_min, self.y_min, img_w, img_h, margin, scale)
             x2, y2 = self.world_to_pixel(self.x_max, self.y_max, img_w, img_h, margin, scale)
             cv2.rectangle(image, (x1, y2), (x2, y1), (80, 80, 80), 3, cv2.LINE_AA)
 
-            # Draw AR Tags as distinct markers
             for i, (tag_x, tag_y) in enumerate(self.tag_map):
                 px, py = self.world_to_pixel(tag_x, tag_y, img_w, img_h, margin, scale)
                 size_px = 7
                 
-                # Bright cyan for tags so they stand out
+               
                 cv2.rectangle(image, (px - size_px, py - size_px), (px + size_px, py + size_px), (255, 255, 0), -1)
                 cv2.rectangle(image, (px - size_px, py - size_px), (px + size_px, py + size_px), (255, 255, 255), 1)
                 
@@ -872,55 +871,54 @@ class DuckiebotParticleFilter:
                             0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
             with self.lock:
-                # Calculate max weight to normalize particle colors
+           
                 max_w = max(p[3] for p in self.particles) if self.particles else 1.0
                 if max_w <= 0.0:
                     max_w = 1.0
 
-                # Draw Particles (Color by weight, include orientation)
                 for p in self.particles:
                     px, py = self.world_to_pixel(p[0], p[1], img_w, img_h, margin, scale)
                     if px < 0 or px >= img_w or py < 0 or py >= img_h:
                         continue
 
-                    # Normalize score
+                   
                     score = max(0.0, min(1.0, p[3] / max_w))
 
-                    # Color Gradient: Blue (Low Weight) -> Red (High Weight)
+                  
                     b = int(255 * (1.0 - score))
                     g = int(50 + 100 * score)
                     r = int(255 * score)
                     color = (b, g, r)
 
-                    # Draw directional tail to represent 'theta'
+                 
                     tail_length = 6
                     end_x = int(px - tail_length * math.cos(p[2]))
-                    end_y = int(py + tail_length * math.sin(p[2]))  # + because OpenCV y is inverted
+                    end_y = int(py + tail_length * math.sin(p[2])) 
                     
                     cv2.line(image, (px, py), (end_x, end_y), color, 1, cv2.LINE_AA)
                     cv2.circle(image, (px, py), 2, color, -1, cv2.LINE_AA)
 
-            # Draw Trajectories
+        
             self.draw_recent_path(image, self.odom_path, color=(150, 150, 150), thickness=2, 
                                 img_w=img_w, img_h=img_h, margin=margin, scale=scale, max_points=250)
             self.draw_recent_path(image, self.pf_path, color=(0, 255, 0), thickness=2, 
                                 img_w=img_w, img_h=img_h, margin=margin, scale=scale, max_points=250)
 
-            # Draw Robot Estimates (Odometry vs PF)
+            
             est_x, est_y, est_theta = self.compute_weighted_estimate()
             self.draw_robot_arrow(image, est_x, est_y, est_theta, color=(0, 255, 0), 
-                                img_w=img_w, img_h=img_h, margin=margin, scale=scale) # PF Estimate is Green
+                                img_w=img_w, img_h=img_h, margin=margin, scale=scale) 
 
             if self.last_pose is not None:
                 odom_x, odom_y, odom_theta = self.last_pose
                 map_odom_x, map_odom_y, map_odom_theta = self.odom_to_map(odom_x, odom_y, odom_theta)
                 self.draw_robot_arrow(image, map_odom_x, map_odom_y, map_odom_theta, color=(150, 150, 150), 
-                                    img_w=img_w, img_h=img_h, margin=margin, scale=scale) # Odom is Gray
+                                    img_w=img_w, img_h=img_h, margin=margin, scale=scale) 
 
-            # UI Overlay / Legend
+        
             cv2.putText(image, "Particle Filter Map", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             
-            # Modern Legend Layout
+           
             cv2.putText(image, "AR Tags", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
             cv2.putText(image, "PF Estimate (Green)", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
             cv2.putText(image, "Odometry (Gray)", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1, cv2.LINE_AA)
